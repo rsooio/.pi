@@ -16,6 +16,33 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import * as path from "node:path";
 import { existsSync, writeFileSync } from "node:fs";
 
+/** Extract display text from the first user message in the branch. */
+function firstUserText(
+  entries: { type: string; message?: { role: string; content: unknown } }[],
+): string | undefined {
+  for (const entry of entries) {
+    if (entry.type !== "message") continue;
+    const msg = entry.message;
+    if (!msg || msg.role !== "user") continue;
+
+    // content is [{"type":"text","text":"..."}, ...]
+    const content = msg.content;
+    if (!Array.isArray(content)) continue;
+    for (const part of content) {
+      if (
+        part &&
+        typeof part === "object" &&
+        (part as { type: string }).type === "text" &&
+        typeof (part as { text: string }).text === "string"
+      ) {
+        const text = (part as { text: string }).text.trim();
+        if (text) return text;
+      }
+    }
+  }
+  return undefined;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -202,6 +229,22 @@ export default function (pi: ExtensionAPI) {
       const currentSessionFile = ctx.sessionManager.getSessionFile();
       const branchEntries = ctx.sessionManager.getBranch();
 
+      // --- Session name (plan A: static, set at creation time) -------
+      // Extract the first user message text so /resume shows both the
+      // branch and the conversation topic.
+      //
+      // Plan B (dynamic update, not implemented): set name = "(<branch>)"
+      // here, then in session_start detect a worktree marker entry and
+      // listen for message_start.  When the first user message arrives,
+      // call pi.setSessionName(`(<branch>) · "<text>"`).  This keeps
+      // the name up to date when /branch is run before any user message
+      // exists.  Currently not worth the complexity — /branch is
+      // typically called with existing context.
+      const userText = firstUserText(branchEntries);
+      const sessionName = userText
+        ? `(${branchName}) · "${userText.slice(0, 50)}${userText.length > 50 ? "..." : ""}"`
+        : `(${branchName})`;
+
       // Remap entry IDs so the new session has its own identity.
       const idMap = new Map<string, string>();
       const entries = branchEntries.map((entry) => {
@@ -216,6 +259,19 @@ export default function (pi: ExtensionAPI) {
           entry.parentId = idMap.get(entry.parentId)!;
         }
       }
+
+      // Append session_info entry so /resume displays the branch name
+      // alongside the conversation topic.
+      const leafId = entries.length > 0
+        ? entries[entries.length - 1].id
+        : null;
+      const sessionInfoEntry = {
+        type: "session_info",
+        id: freshId(),
+        parentId: leafId,
+        timestamp: new Date().toISOString(),
+        name: sessionName,
+      };
 
       const newId = freshId();
       const timestamp = new Date().toISOString();
@@ -236,7 +292,7 @@ export default function (pi: ExtensionAPI) {
           : {}),
       };
 
-      const lines = [header, ...entries].map((e) => JSON.stringify(e));
+      const lines = [header, ...entries, sessionInfoEntry].map((e) => JSON.stringify(e));
       writeFileSync(newFile, lines.join("\n") + "\n");
 
       // ── Switch — runtime is rebuilt with the worktree as cwd ───────
