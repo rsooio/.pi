@@ -26,19 +26,42 @@ async function ensureGitRepo(pi: ExtensionAPI): Promise<boolean> {
 }
 
 async function listBranches(pi: ExtensionAPI): Promise<string[]> {
-  const { stdout } = await pi.exec("git", [
-    "branch", "-a", "--format=%(refname:short)",
+  // Fetch local and all branches separately to reliably distinguish them.
+  const [localOut, allOut] = await Promise.all([
+    pi.exec("git", ["branch", "--format=%(refname:short)"]),
+    pi.exec("git", ["branch", "-a", "--format=%(refname:short)"]),
   ]);
-  const lines = stdout.trim().split("\n").filter(Boolean);
+
+  const localNames = new Set(
+    localOut.stdout.trim().split("\n").filter(Boolean),
+  );
+
+  const lines = allOut.stdout.trim().split("\n").filter(Boolean);
   const seen = new Set<string>();
   const result: string[] = [];
+
   for (const line of lines) {
-    if (line.includes("->")) continue;
-    const cleaned = line.replace(/^remotes\//, "");
-    if (seen.has(cleaned)) continue;
-    seen.add(cleaned);
-    result.push(cleaned);
+    if (line.includes("->") || line.endsWith("/HEAD")) continue;
+
+    // Normalise: strip ref prefixes that some git versions leave behind.
+    const name = line.replace(/^(remotes|heads)\//, "");
+    if (seen.has(name)) continue;
+
+    // Bare remote roots (e.g. "origin" without a branch) have no slash
+    // and are not real local branches — drop them.
+    if (!name.includes("/") && !localNames.has(name)) continue;
+
+    // Drop remote-tracking branch if a local branch with the short name
+    // already exists (e.g. skip "origin/main" when "main" exists).
+    if (name.includes("/")) {
+      const short = name.slice(name.indexOf("/") + 1);
+      if (localNames.has(short)) continue;
+    }
+
+    seen.add(name);
+    result.push(name);
   }
+
   return result.sort((a, b) => {
     const aR = a.includes("/") ? 1 : 0;
     const bR = b.includes("/") ? 1 : 0;
