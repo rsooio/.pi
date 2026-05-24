@@ -1,0 +1,5 @@
+/bin/
+/npm/
+/sessions/
+auth.json
+node_modules/

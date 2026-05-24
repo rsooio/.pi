@@ -1,0 +1,17 @@
+{
+  "lastChangelogVersion": "0.75.5",
+  "defaultProvider": "deepseek",
+  "defaultModel": "deepseek-v4-pro",
+  "compaction": {
+    "enabled": true
+  },
+  "images": {
+    "autoResize": true
+  },
+  "editorPaddingX": 0,
+  "defaultThinkingLevel": "xhigh",
+  "hideThinkingBlock": false,
+  "packages": [
+    "npm:@juicesharp/rpiv-ask-user-question"
+  ]
+}
