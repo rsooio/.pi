@@ -84,7 +84,6 @@ export default function (pi: ExtensionAPI) {
     description: "Switch to or create a git branch with worktree",
     handler: async (args, ctx) => {
       const cwd = ctx.cwd;
-      const projectName = path.basename(cwd);
 
       if (!(await ensureGitRepo(pi))) {
         ctx.ui.notify("Not a git repository (or no git installed)", "error");
@@ -110,6 +109,15 @@ export default function (pi: ExtensionAPI) {
         if (!branchName) {
           ctx.ui.notify("Cancelled", "info");
           return;
+        }
+      }
+
+      // ── Resolve remote branch names to local short names ───────────
+      const slashIdx = branchName.indexOf("/");
+      if (slashIdx > 0 && !(await localBranchExists(branchName, pi))) {
+        const remote = await findRemoteRef(branchName, pi);
+        if (remote) {
+          branchName = branchName.slice(slashIdx + 1);
         }
       }
 
@@ -144,9 +152,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       // ── Create worktree on disk ────────────────────────────────────
-      const worktreeDir = path.resolve(
-        cwd, ".pi", "worktree", projectName, branchName,
-      );
+      const worktreeDir = path.resolve(cwd, ".worktree", branchName);
 
       if (!existsSync(worktreeDir)) {
         let gitArgs: string[];
