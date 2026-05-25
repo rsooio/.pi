@@ -16,7 +16,55 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import * as path from "node:path";
 import { existsSync, writeFileSync } from "node:fs";
 
-/** Extract display text from the first user message in the branch. */
+// ---------------------------------------------------------------------------
+// Path rewriting
+// ---------------------------------------------------------------------------
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Replace `fromCwd/...` with `toCwd/...`, skipping paths already under `.worktree/`. */
+function rewritePathPrefix(s: string, fromCwd: string, toCwd: string): string {
+  const escaped = escapeRegex(fromCwd);
+  return s.replace(new RegExp(`${escaped}/(?!\\.worktree/)`, "g"), `${toCwd}/`);
+}
+
+/** JSON-roundtrip an entry, rewriting all string values with the given prefix mapping. */
+function rewriteEntryPaths<T>(entry: T, fromCwd: string, toCwd: string): T {
+  return JSON.parse(rewritePathPrefix(JSON.stringify(entry), fromCwd, toCwd)) as T;
+}
+
+/** Derive `{ from, to }` from a worktree cwd.  Returns null for non-worktree dirs. */
+function worktreeRewrite(cwd: string): { from: string; to: string } | null {
+  const idx = cwd.indexOf("/.worktree/");
+  if (idx === -1) return null;
+  return { from: cwd.slice(0, idx), to: cwd };
+}
+
+/** Rewrite path / file_path / edits[].oldText / edits[].newText in place. */
+function rewriteToolInput(input: Record<string, unknown>, from: string, to: string): void {
+  for (const key of ["path", "file_path"]) {
+    const val = input[key];
+    if (typeof val === "string") input[key] = rewritePathPrefix(val, from, to);
+  }
+  const edits = input["edits"];
+  if (Array.isArray(edits)) {
+    for (const edit of edits) {
+      if (edit && typeof edit === "object") {
+        for (const ek of ["oldText", "newText"]) {
+          const ev = (edit as Record<string, unknown>)[ek];
+          if (typeof ev === "string") (edit as Record<string, unknown>)[ek] = rewritePathPrefix(ev, from, to);
+        }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 function firstUserText(
   entries: { type: string; message?: { role: string; content: unknown } }[],
 ): string | undefined {
@@ -24,8 +72,6 @@ function firstUserText(
     if (entry.type !== "message") continue;
     const msg = entry.message;
     if (!msg || msg.role !== "user") continue;
-
-    // content is [{"type":"text","text":"..."}, ...]
     const content = msg.content;
     if (!Array.isArray(content)) continue;
     for (const part of content) {
@@ -43,17 +89,12 @@ function firstUserText(
   return undefined;
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
 async function ensureGitRepo(pi: ExtensionAPI): Promise<boolean> {
   const { code } = await pi.exec("git", ["rev-parse", "--git-dir"]);
   return code === 0;
 }
 
 async function listBranches(pi: ExtensionAPI): Promise<string[]> {
-  // Fetch local and all branches separately to reliably distinguish them.
   const [localOut, allOut] = await Promise.all([
     pi.exec("git", ["branch", "--format=%(refname:short)"]),
     pi.exec("git", ["branch", "-a", "--format=%(refname:short)"]),
@@ -69,22 +110,13 @@ async function listBranches(pi: ExtensionAPI): Promise<string[]> {
 
   for (const line of lines) {
     if (line.includes("->") || line.endsWith("/HEAD")) continue;
-
-    // Normalise: strip ref prefixes that some git versions leave behind.
     const name = line.replace(/^(remotes|heads)\//, "");
     if (seen.has(name)) continue;
-
-    // Bare remote roots (e.g. "origin" without a branch) have no slash
-    // and are not real local branches — drop them.
     if (!name.includes("/") && !localNames.has(name)) continue;
-
-    // Drop remote-tracking branch if a local branch with the short name
-    // already exists (e.g. skip "origin/main" when "main" exists).
     if (name.includes("/")) {
       const short = name.slice(name.indexOf("/") + 1);
       if (localNames.has(short)) continue;
     }
-
     seen.add(name);
     result.push(name);
   }
@@ -97,20 +129,14 @@ async function listBranches(pi: ExtensionAPI): Promise<string[]> {
   });
 }
 
-async function localBranchExists(
-  branch: string,
-  pi: ExtensionAPI,
-): Promise<boolean> {
+async function localBranchExists(branch: string, pi: ExtensionAPI): Promise<boolean> {
   const { code } = await pi.exec("git", [
     "show-ref", "--verify", "--quiet", `refs/heads/${branch}`,
   ]);
   return code === 0;
 }
 
-async function findRemoteRef(
-  branch: string,
-  pi: ExtensionAPI,
-): Promise<string | null> {
+async function findRemoteRef(branch: string, pi: ExtensionAPI): Promise<string | null> {
   const { stdout } = await pi.exec("git", [
     "branch", "-r", "--format=%(refname:short)",
   ]);
@@ -120,7 +146,6 @@ async function findRemoteRef(
   return null;
 }
 
-/** Generate a fresh ID for a cloned entry, remapping old→new. */
 function freshId(): string {
   return crypto.randomUUID();
 }
@@ -130,6 +155,15 @@ function freshId(): string {
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
+  // Correct absolute paths that the LLM occasionally points at the original
+  // project directory instead of the worktree.  The rewrite pair is derived
+  // from ctx.cwd at call time so the fix works across pi restarts.
+  pi.on("tool_call", (event, ctx) => {
+    const rw = worktreeRewrite(ctx.cwd);
+    if (!rw || !("input" in event)) return;
+    rewriteToolInput(event.input as Record<string, unknown>, rw.from, rw.to);
+  });
+
   pi.registerCommand("branch", {
     description: "Switch to or create a git branch with worktree",
     handler: async (args, ctx) => {
@@ -140,7 +174,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      // ── Parse args ─────────────────────────────────────────────────
+      // Parse args
       const parts = args.trim().split(/\s+/).filter(Boolean);
       let branchName = parts[0];
       let fromBranch = parts[1];
@@ -162,20 +196,16 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      // ── Resolve remote branch names to local short names ───────────
+      // Resolve remote branch names to local short names
       const slashIdx = branchName.indexOf("/");
       if (slashIdx > 0 && !(await localBranchExists(branchName, pi))) {
         const remote = await findRemoteRef(branchName, pi);
-        if (remote) {
-          branchName = branchName.slice(slashIdx + 1);
-        }
+        if (remote) branchName = branchName.slice(slashIdx + 1);
       }
 
-      // ── Resolve branch ─────────────────────────────────────────────
+      // Resolve branch
       const existsLocally = await localBranchExists(branchName, pi);
-      const remoteRef = !existsLocally
-        ? await findRemoteRef(branchName, pi)
-        : null;
+      const remoteRef = !existsLocally ? await findRemoteRef(branchName, pi) : null;
       const branchExists = existsLocally || remoteRef !== null;
 
       if (!branchExists && !fromBranch) {
@@ -188,9 +218,7 @@ export default function (pi: ExtensionAPI) {
         }
         const branches = await listBranches(pi);
         const def = branches.find((b) => b === "main" || b === "master");
-        const sorted = def
-          ? [def, ...branches.filter((b) => b !== def)]
-          : branches;
+        const sorted = def ? [def, ...branches.filter((b) => b !== def)] : branches;
         fromBranch = await ctx.ui.select(
           `Branch '${branchName}' not found — create from which branch?`,
           sorted,
@@ -201,7 +229,7 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      // ── Create worktree on disk ────────────────────────────────────
+      // Create worktree on disk
       const worktreeDir = path.resolve(cwd, ".worktree", branchName);
 
       if (!existsSync(worktreeDir)) {
@@ -209,13 +237,9 @@ export default function (pi: ExtensionAPI) {
         if (existsLocally) {
           gitArgs = ["worktree", "add", worktreeDir, branchName];
         } else if (remoteRef) {
-          gitArgs = [
-            "worktree", "add", "-b", branchName, worktreeDir, remoteRef,
-          ];
+          gitArgs = ["worktree", "add", "-b", branchName, worktreeDir, remoteRef];
         } else {
-          gitArgs = [
-            "worktree", "add", "-b", branchName, worktreeDir, fromBranch!,
-          ];
+          gitArgs = ["worktree", "add", "-b", branchName, worktreeDir, fromBranch!];
         }
         const result = await pi.exec("git", gitArgs);
         if (result.code !== 0) {
@@ -225,46 +249,31 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      // ── Clone history into a new session file ──────────────────────
+      // Clone history into a new session file
       const currentSessionFile = ctx.sessionManager.getSessionFile();
       const branchEntries = ctx.sessionManager.getBranch();
 
-      // --- Session name (plan A: static, set at creation time) -------
-      // Extract the first user message text so /resume shows both the
-      // branch and the conversation topic.
-      //
-      // Plan B (dynamic update, not implemented): set name = "(<branch>)"
-      // here, then in session_start detect a worktree marker entry and
-      // listen for message_start.  When the first user message arrives,
-      // call pi.setSessionName(`(<branch>) · "<text>"`).  This keeps
-      // the name up to date when /branch is run before any user message
-      // exists.  Currently not worth the complexity — /branch is
-      // typically called with existing context.
       const userText = firstUserText(branchEntries);
       const sessionName = userText
         ? `(${branchName}) · "${userText.slice(0, 50)}${userText.length > 50 ? "..." : ""}"`
         : `(${branchName})`;
 
-      // Remap entry IDs so the new session has its own identity.
+      // Remap entry IDs and rewrite any absolute paths pointing to the
+      // original project so the LLM does not reuse stale paths from history.
       const idMap = new Map<string, string>();
       const entries = branchEntries.map((entry) => {
         const newId = freshId();
         idMap.set(entry.id, newId);
-        return { ...entry, id: newId };
+        return { ...rewriteEntryPaths(entry, cwd, worktreeDir), id: newId };
       });
 
-      // Rewire parentId pointers.
       for (const entry of entries) {
         if (entry.parentId && idMap.has(entry.parentId)) {
           entry.parentId = idMap.get(entry.parentId)!;
         }
       }
 
-      // Append session_info entry so /resume displays the branch name
-      // alongside the conversation topic.
-      const leafId = entries.length > 0
-        ? entries[entries.length - 1].id
-        : null;
+      const leafId = entries.length > 0 ? entries[entries.length - 1].id : null;
       const sessionInfoEntry = {
         type: "session_info",
         id: freshId(),
@@ -277,9 +286,7 @@ export default function (pi: ExtensionAPI) {
       const timestamp = new Date().toISOString();
       const fileTs = timestamp.replace(/[:.]/g, "-");
       const sessionDir = ctx.sessionManager.getSessionDir();
-      const newFile = path.join(
-        sessionDir, `${fileTs}_${newId}.jsonl`,
-      );
+      const newFile = path.join(sessionDir, `${fileTs}_${newId}.jsonl`);
 
       const header = {
         type: "session" as const,
@@ -287,16 +294,14 @@ export default function (pi: ExtensionAPI) {
         id: newId,
         timestamp,
         cwd: worktreeDir,
-        ...(currentSessionFile
-          ? { parentSession: currentSessionFile }
-          : {}),
+        ...(currentSessionFile ? { parentSession: currentSessionFile } : {}),
       };
 
       const lines = [header, ...entries, sessionInfoEntry].map((e) => JSON.stringify(e));
       writeFileSync(newFile, lines.join("\n") + "\n");
 
-      // ── Switch — runtime is rebuilt with the worktree as cwd ───────
-      // After this call the current ctx is stale.  Do NOT use it.
+      // Switch to the new session — runtime is rebuilt with the worktree as cwd.
+      // After this call the current ctx is stale; do NOT use it.
       await ctx.switchSession(newFile, {
         withSession: async (newCtx) => {
           newCtx.ui.notify(`Worktree: ${worktreeDir}`, "info");
